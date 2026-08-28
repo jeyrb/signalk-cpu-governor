@@ -23,9 +23,21 @@ Cortex-A72 (cores 4-7)"). Each group gets an ordered list of rule names. Every
 match wins** and its governor is applied. If no rule matches, the group's governor is
 left alone (hysteresis — it won't flap).
 
-CPU type detection reads `CPU implementer` / `CPU part` from `/proc/cpuinfo` (ARM
-cores) and maps known part codes to friendly names (Cortex-A53, Cortex-A72, etc.);
-unrecognized ARM parts show as `part 0x...`, and non-ARM CPUs group by `model name`.
+CPU type detection reads `/proc/cpuinfo` and works across architectures:
+
+- **ARM**: groups by `CPU implementer` / `CPU part`, mapped to friendly names
+  (Cortex-A53, Cortex-A72, etc.) via a lookup table; unrecognized parts show as
+  `part 0x...`.
+- **RISC-V**: groups by `mvendorid`/`marchid` where the kernel exposes them, falling
+  back to the `isa` string (e.g. `RISC-V (rv64imafdc)`) on kernels that don't. The
+  vendor/arch-id → friendly-name table is currently just a seed (a wrong guess there
+  would silently mislabel a board) — cores still group and work correctly either way,
+  just displayed with the raw hex until a name is added. **Contributions welcome**:
+  send a PR with `cat /proc/cpuinfo` from your board to add an entry.
+- **x86_64 and everything else**: groups by `model name`. On Intel hybrid designs
+  (P-core/E-core), where every core reports the same `model name`, the split is
+  refined using the kernel's `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`
+  cpumasks.
 
 Check available governors on your board first:
 

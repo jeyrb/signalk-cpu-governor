@@ -44,6 +44,62 @@ function cpuPartName (implementer, part) {
   return part
 }
 
+// RISC-V mvendorid/marchid identify a core the same way ARM's implementer/part
+// do, but there's no widely-published lookup table for them and getting a hex
+// code wrong here would just silently mislabel a board, so this seed is
+// intentionally sparse. Send a PR with `cat /proc/cpuinfo` output from your
+// board to add an entry — until then, cores group correctly, just displayed
+// with the raw hex.
+const RISCV_VENDOR_ARCH_NAMES = {
+  // '0x489:0x8000000000000007': 'SiFive U74'
+}
+
+function riscvName (mvendorid, marchid, isa) {
+  if (mvendorid && marchid) {
+    const key = `${mvendorid}:${marchid}`
+    if (RISCV_VENDOR_ARCH_NAMES[key]) return RISCV_VENDOR_ARCH_NAMES[key]
+    return `RISC-V vendor ${mvendorid} arch ${marchid}`
+  }
+  if (isa) return `RISC-V (${isa})`
+  return 'RISC-V'
+}
+
+function parseCpuList (str) {
+  const ids = new Set()
+  for (const part of String(str).trim().split(',')) {
+    if (!part) continue
+    if (part.includes('-')) {
+      const [a, b] = part.split('-').map(Number)
+      for (let i = a; i <= b; i++) ids.add(i)
+    } else {
+      ids.add(Number(part))
+    }
+  }
+  return ids
+}
+
+// Intel hybrid (P-core/E-core) designs report the same "model name" for every
+// core in /proc/cpuinfo, so grouping by model alone can't tell them apart.
+// The kernel exposes the real split via these sysfs cpumasks instead.
+function detectIntelHybridCoreTypes () {
+  const types = new Map()
+  const sources = [
+    ['/sys/devices/cpu_core/cpus', 'P-core'],
+    ['/sys/devices/cpu_atom/cpus', 'E-core']
+  ]
+  for (const [file, label] of sources) {
+    try {
+      if (!fs.existsSync(file)) continue
+      for (const id of parseCpuList(fs.readFileSync(file, 'utf8'))) {
+        types.set(id, label)
+      }
+    } catch (err) {
+      // sysfs race or unreadable — ignore, hybrid split is best-effort
+    }
+  }
+  return types
+}
+
 function safeId (key) {
   return key.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'cpu'
 }
@@ -82,7 +138,15 @@ function detectCpuGroups () {
     const processorMatch = line.match(/^processor\s*:\s*(\d+)/)
     if (processorMatch) {
       if (current) cores.push(current)
-      current = { id: parseInt(processorMatch[1], 10), implementer: null, part: null, model: null }
+      current = {
+        id: parseInt(processorMatch[1], 10),
+        implementer: null,
+        part: null,
+        mvendorid: null,
+        marchid: null,
+        isa: null,
+        model: null
+      }
       continue
     }
     if (!current) continue
@@ -97,6 +161,24 @@ function detectCpuGroups () {
       current.implementer = implMatch[1].toLowerCase()
       continue
     }
+    // RISC-V core identification (mainline kernels expose these on newer
+    // hardware; older ones only have "isa", handled below as a fallback).
+    const mvendoridMatch = line.match(/^mvendorid\s*:\s*(0x[0-9a-fA-F]+)/)
+    if (mvendoridMatch) {
+      current.mvendorid = mvendoridMatch[1].toLowerCase()
+      continue
+    }
+    const marchidMatch = line.match(/^marchid\s*:\s*(0x[0-9a-fA-F]+)/)
+    if (marchidMatch) {
+      current.marchid = marchidMatch[1].toLowerCase()
+      continue
+    }
+    const isaMatch = line.match(/^isa\s*:\s*(.+)$/)
+    if (isaMatch) {
+      current.isa = isaMatch[1].trim()
+      continue
+    }
+    // x86_64 and most other architectures report this per core.
     const modelMatch = line.match(/^model name\s*:\s*(.+)$/)
     if (modelMatch) {
       current.model = modelMatch[1].trim()
@@ -106,29 +188,43 @@ function detectCpuGroups () {
 
   if (cores.length === 0) return fallbackSingleGroup()
 
+  const hybridTypes = detectIntelHybridCoreTypes()
+
   const groups = new Map()
   for (const core of cores) {
-    let key, implementer, part
+    let key, name
     if (core.part) {
-      implementer = core.implementer || '0x41'
-      part = core.part
-      key = `${implementer}:${part}`
+      const implementer = core.implementer || '0x41'
+      key = `${implementer}:${core.part}`
+      name = cpuPartName(implementer, core.part)
+    } else if (core.mvendorid || core.marchid || core.isa) {
+      key = core.mvendorid && core.marchid
+        ? `riscv:${core.mvendorid}:${core.marchid}`
+        : `riscv:${core.isa || 'unknown'}`
+      name = riscvName(core.mvendorid, core.marchid, core.isa)
     } else if (core.model) {
-      implementer = null
-      part = core.model
       key = core.model
+      name = core.model
     } else {
-      implementer = null
-      part = 'unknown'
       key = 'unknown'
+      name = 'unknown'
     }
-    if (!groups.has(key)) groups.set(key, { key, implementer, part, cores: [] })
+
+    // Split hybrid designs (e.g. Intel P-core/E-core) that would otherwise
+    // collapse into one group since every core reports the same identity.
+    const hybridLabel = hybridTypes.get(core.id)
+    if (hybridLabel) {
+      key += `:${hybridLabel}`
+      name = `${name} ${hybridLabel}`
+    }
+
+    if (!groups.has(key)) groups.set(key, { key, name, cores: [] })
     groups.get(key).cores.push(core.id)
   }
 
   return Array.from(groups.values()).map((g) => ({
     id: safeId(g.key),
-    name: g.implementer ? cpuPartName(g.implementer, g.part) : g.part,
+    name: g.name,
     cores: g.cores.sort((a, b) => a - b)
   }))
 }
@@ -192,7 +288,7 @@ module.exports = function (app) {
     id: 'signalk-cpu-governor',
     name: 'CPU Governor Switcher',
     description:
-      'Switches per-cluster SBC CPU frequency governors based on rules matched against SignalK data paths.'
+      'Tunes CPU speeds based on rules matched against SignalK data paths.'
   }
 
   let timer
