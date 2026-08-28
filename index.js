@@ -1,104 +1,8 @@
 const fs = require('fs')
 const path = require('path')
+const { execFileSync } = require('child_process')
 
 const CPU_BASE = '/sys/devices/system/cpu'
-const CPUINFO_PATH = '/proc/cpuinfo'
-
-const ARM_IMPLEMENTERS = {
-  '0x41': 'ARM',
-  '0x42': 'Broadcom',
-  '0x43': 'Cavium',
-  '0x48': 'HiSilicon',
-  '0x4e': 'Nvidia',
-  '0x50': 'APM',
-  '0x51': 'Qualcomm',
-  '0x53': 'Samsung',
-  '0x56': 'Marvell',
-  '0x61': 'Apple',
-  '0x69': 'Intel'
-}
-
-// ARM implementer (0x41) core part numbers
-const ARM_PARTS = {
-  '0xd03': 'Cortex-A53',
-  '0xd04': 'Cortex-A35',
-  '0xd05': 'Cortex-A55',
-  '0xd07': 'Cortex-A57',
-  '0xd08': 'Cortex-A72',
-  '0xd09': 'Cortex-A73',
-  '0xd0a': 'Cortex-A75',
-  '0xd0b': 'Cortex-A76',
-  '0xd0c': 'Neoverse-N1',
-  '0xd0d': 'Cortex-A77',
-  '0xd41': 'Cortex-A78',
-  '0xd44': 'Cortex-X1',
-  '0xd46': 'Cortex-A510',
-  '0xd47': 'Cortex-A710',
-  '0xd48': 'Cortex-X2'
-}
-
-function cpuPartName (implementer, part) {
-  if (implementer === '0x41' && ARM_PARTS[part]) return ARM_PARTS[part]
-  const implName = ARM_IMPLEMENTERS[implementer]
-  if (implName) return `${implName} part ${part}`
-  return part
-}
-
-// RISC-V mvendorid/marchid identify a core the same way ARM's implementer/part
-// do, but there's no widely-published lookup table for them and getting a hex
-// code wrong here would just silently mislabel a board, so this seed is
-// intentionally sparse. Send a PR with `cat /proc/cpuinfo` output from your
-// board to add an entry — until then, cores group correctly, just displayed
-// with the raw hex.
-const RISCV_VENDOR_ARCH_NAMES = {
-  // '0x489:0x8000000000000007': 'SiFive U74'
-}
-
-function riscvName (mvendorid, marchid, isa) {
-  if (mvendorid && marchid) {
-    const key = `${mvendorid}:${marchid}`
-    if (RISCV_VENDOR_ARCH_NAMES[key]) return RISCV_VENDOR_ARCH_NAMES[key]
-    return `RISC-V vendor ${mvendorid} arch ${marchid}`
-  }
-  if (isa) return `RISC-V (${isa})`
-  return 'RISC-V'
-}
-
-function parseCpuList (str) {
-  const ids = new Set()
-  for (const part of String(str).trim().split(',')) {
-    if (!part) continue
-    if (part.includes('-')) {
-      const [a, b] = part.split('-').map(Number)
-      for (let i = a; i <= b; i++) ids.add(i)
-    } else {
-      ids.add(Number(part))
-    }
-  }
-  return ids
-}
-
-// Intel hybrid (P-core/E-core) designs report the same "model name" for every
-// core in /proc/cpuinfo, so grouping by model alone can't tell them apart.
-// The kernel exposes the real split via these sysfs cpumasks instead.
-function detectIntelHybridCoreTypes () {
-  const types = new Map()
-  const sources = [
-    ['/sys/devices/cpu_core/cpus', 'P-core'],
-    ['/sys/devices/cpu_atom/cpus', 'E-core']
-  ]
-  for (const [file, label] of sources) {
-    try {
-      if (!fs.existsSync(file)) continue
-      for (const id of parseCpuList(fs.readFileSync(file, 'utf8'))) {
-        types.set(id, label)
-      }
-    } catch (err) {
-      // sysfs race or unreadable — ignore, hybrid split is best-effort
-    }
-  }
-  return types
-}
 
 function safeId (key) {
   return key.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'cpu'
@@ -122,125 +26,71 @@ function coreRangeLabel (ids) {
   return ranges.join(',')
 }
 
+// `lscpu` (util-linux) already ships (and maintains) its own vendor/model
+// name tables for every architecture, so we don't hand-roll one. lscpu -J
+// lists each detected CPU model as a flat "Model name:" entry, each followed
+// by its own "Core(s) per socket:" / "Socket(s):" / "Thread(s) per core:" —
+// enough to say how many cores of that model exist, which is all a governor
+// policy needs (it's applied per model type / per whole CPU, not per
+// individual core). Exactly which logical core ids those are doesn't need to
+// be pinned down independently: the kernel always enumerates a cluster's
+// cores contiguously in discovery order, so the Nth model block simply
+// claims the next `count` ids — the same order lscpu itself walked to
+// produce these blocks.
+//
+// Returns null if lscpu isn't installed or its output can't be trusted (the
+// counts don't add up to the board's total CPU count) — the plugin disables
+// itself in that case rather than guess at CPU topology.
 function detectCpuGroups () {
-  let text
+  let fields
   try {
-    text = fs.readFileSync(CPUINFO_PATH, 'utf8')
-  } catch (err) {
-    return fallbackSingleGroup()
-  }
-
-  // Parse line-by-line (not by blank-line blocks) since block spacing in
-  // /proc/cpuinfo varies across kernels and a mis-split silently merges cores.
-  const cores = []
-  let current = null
-  for (const line of text.split('\n')) {
-    const processorMatch = line.match(/^processor\s*:\s*(\d+)/)
-    if (processorMatch) {
-      if (current) cores.push(current)
-      current = {
-        id: parseInt(processorMatch[1], 10),
-        implementer: null,
-        part: null,
-        mvendorid: null,
-        marchid: null,
-        isa: null,
-        model: null
+    const summary = JSON.parse(execFileSync('lscpu', ['-J'], { encoding: 'utf8' }))
+    fields = []
+    const collect = (nodes) => {
+      for (const n of nodes || []) {
+        fields.push(n)
+        if (n.children) collect(n.children)
       }
-      continue
     }
-    if (!current) continue
-
-    const partMatch = line.match(/^CPU part\s*:\s*(0x[0-9a-fA-F]+)/)
-    if (partMatch) {
-      current.part = partMatch[1].toLowerCase()
-      continue
-    }
-    const implMatch = line.match(/^CPU implementer\s*:\s*(0x[0-9a-fA-F]+)/)
-    if (implMatch) {
-      current.implementer = implMatch[1].toLowerCase()
-      continue
-    }
-    // RISC-V core identification (mainline kernels expose these on newer
-    // hardware; older ones only have "isa", handled below as a fallback).
-    const mvendoridMatch = line.match(/^mvendorid\s*:\s*(0x[0-9a-fA-F]+)/)
-    if (mvendoridMatch) {
-      current.mvendorid = mvendoridMatch[1].toLowerCase()
-      continue
-    }
-    const marchidMatch = line.match(/^marchid\s*:\s*(0x[0-9a-fA-F]+)/)
-    if (marchidMatch) {
-      current.marchid = marchidMatch[1].toLowerCase()
-      continue
-    }
-    const isaMatch = line.match(/^isa\s*:\s*(.+)$/)
-    if (isaMatch) {
-      current.isa = isaMatch[1].trim()
-      continue
-    }
-    // x86_64 and most other architectures report this per core.
-    const modelMatch = line.match(/^model name\s*:\s*(.+)$/)
-    if (modelMatch) {
-      current.model = modelMatch[1].trim()
-    }
-  }
-  if (current) cores.push(current)
-
-  if (cores.length === 0) return fallbackSingleGroup()
-
-  const hybridTypes = detectIntelHybridCoreTypes()
-
-  const groups = new Map()
-  for (const core of cores) {
-    let key, name
-    if (core.part) {
-      const implementer = core.implementer || '0x41'
-      key = `${implementer}:${core.part}`
-      name = cpuPartName(implementer, core.part)
-    } else if (core.mvendorid || core.marchid || core.isa) {
-      key = core.mvendorid && core.marchid
-        ? `riscv:${core.mvendorid}:${core.marchid}`
-        : `riscv:${core.isa || 'unknown'}`
-      name = riscvName(core.mvendorid, core.marchid, core.isa)
-    } else if (core.model) {
-      key = core.model
-      name = core.model
-    } else {
-      key = 'unknown'
-      name = 'unknown'
-    }
-
-    // Split hybrid designs (e.g. Intel P-core/E-core) that would otherwise
-    // collapse into one group since every core reports the same identity.
-    const hybridLabel = hybridTypes.get(core.id)
-    if (hybridLabel) {
-      key += `:${hybridLabel}`
-      name = `${name} ${hybridLabel}`
-    }
-
-    if (!groups.has(key)) groups.set(key, { key, name, cores: [] })
-    groups.get(key).cores.push(core.id)
-  }
-
-  return Array.from(groups.values()).map((g) => ({
-    id: safeId(g.key),
-    name: g.name,
-    cores: g.cores.sort((a, b) => a - b)
-  }))
-}
-
-function fallbackSingleGroup () {
-  let ids
-  try {
-    ids = fs
-      .readdirSync(CPU_BASE)
-      .filter((name) => /^cpu\d+$/.test(name))
-      .map((name) => parseInt(name.slice(3), 10))
+    collect(summary.lscpu)
   } catch (err) {
-    ids = []
+    return null
   }
-  if (ids.length === 0) return []
-  return [{ id: 'all', name: 'CPU', cores: ids.sort((a, b) => a - b) }]
+
+  let totalCpus = null
+  const blocks = []
+  let block = null
+  for (const f of fields) {
+    const key = String(f.field || '').replace(/:$/, '').trim()
+    if (!block && key === 'CPU(s)') {
+      totalCpus = parseInt(f.data, 10)
+      continue
+    }
+    if (key === 'Model name') {
+      block = { name: f.data, coresPerSocket: null, sockets: 1, threadsPerCore: 1 }
+      blocks.push(block)
+      continue
+    }
+    if (!block) continue
+    if (key === 'Core(s) per socket') block.coresPerSocket = parseInt(f.data, 10)
+    else if (key === 'Socket(s)') block.sockets = parseInt(f.data, 10)
+    else if (key === 'Thread(s) per core') block.threadsPerCore = parseInt(f.data, 10)
+  }
+  if (blocks.length === 0 || totalCpus === null) return null
+
+  const counted = blocks.map((b) => ({
+    name: b.name,
+    count: (b.coresPerSocket || 0) * (b.sockets || 1) * (b.threadsPerCore || 1)
+  }))
+  if (counted.some((b) => !b.count)) return null
+  if (counted.reduce((n, b) => n + b.count, 0) !== totalCpus) return null
+
+  let nextId = 0
+  return counted.map((b) => {
+    const cores = []
+    for (let i = 0; i < b.count; i++) cores.push(nextId++)
+    return { id: safeId(`${b.name}_${cores[0]}_${cores[cores.length - 1]}`), name: b.name, cores }
+  })
 }
 
 function groupGovernorFiles (group) {
@@ -294,17 +144,22 @@ module.exports = function (app) {
   let timer
 
   plugin.schema = () => {
-    const groups = detectCpuGroups()
+    const groups = detectCpuGroups() || []
 
     const groupProperties = {}
     for (const group of groups) {
+      // The SignalK admin form doesn't render a nested object's own "title"
+      // as a section header, so the CPU cluster's identity has to live on
+      // the one visible leaf field (ruleSet) instead, or groups become
+      // indistinguishable in the UI.
+      const groupLabel = `${group.cores.length}x ${group.name} (cores ${coreRangeLabel(group.cores)})`
       groupProperties[group.id] = {
         type: 'object',
-        title: `${group.cores.length}x ${group.name} (cores ${coreRangeLabel(group.cores)})`,
+        title: groupLabel,
         properties: {
           ruleSet: {
             type: 'array',
-            title: 'Rule names, in priority order (first match wins; if none match, the governor is left unchanged)',
+            title: `${groupLabel} — rule names, in priority order (first match wins; if none match, the governor is left unchanged)`,
             items: { type: 'string' },
             default: []
           }
@@ -368,8 +223,9 @@ module.exports = function (app) {
         groups: {
           type: 'object',
           title: 'CPU groups',
-          description:
-            'CPU clusters detected on this device. Assign each an ordered list of rule names.',
+          description: groups.length === 0
+            ? 'No CPU clusters detected — is `lscpu` (util-linux) installed? See README.'
+            : 'CPU clusters detected on this device. Assign each an ordered list of rule names.',
           properties: groupProperties
         }
       }
@@ -384,8 +240,13 @@ module.exports = function (app) {
     }
 
     const detectedGroups = detectCpuGroups()
-    if (detectedGroups.length === 0) {
-      app.error(`No cpufreq scaling_governor files found under ${CPU_BASE} — this board/kernel may not expose cpufreq.`)
+    if (!detectedGroups) {
+      app.error(
+        '`lscpu` (util-linux) was not found, or its output could not be parsed — this plugin requires it ' +
+          'to detect CPU clusters. Install util-linux (e.g. `apk add util-linux` on Alpine) and restart ' +
+          'SignalK. Plugin disabled.'
+      )
+      app.setPluginStatus('Disabled: lscpu not available')
       return
     }
 
@@ -406,7 +267,8 @@ module.exports = function (app) {
       .filter(Boolean)
 
     if (runtimeGroups.length === 0) {
-      app.error(`No writable/detected cpufreq scaling_governor files found under ${CPU_BASE}.`)
+      app.error(`No cpufreq scaling_governor files found under ${CPU_BASE} — this board/kernel may not expose cpufreq. Plugin disabled.`)
+      app.setPluginStatus('Disabled: no cpufreq scaling_governor files found')
       return
     }
 

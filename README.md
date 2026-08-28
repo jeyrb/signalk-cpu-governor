@@ -5,8 +5,8 @@ per CPU cluster, driven by rules matched against any SignalK path — battery
 voltage/SOC, shore power presence, navigation state, whatever you point it at.
 
 Handles big.LITTLE / heterogeneous boards (e.g. 4x Cortex-A53 + 4x Cortex-A72) by
-detecting each distinct CPU core type from `/proc/cpuinfo` and letting you assign a
-different rule set to each cluster.
+detecting each distinct CPU core type and letting you assign a different rule set to
+each cluster.
 
 ## How it works
 
@@ -23,21 +23,25 @@ Cortex-A72 (cores 4-7)"). Each group gets an ordered list of rule names. Every
 match wins** and its governor is applied. If no rule matches, the group's governor is
 left alone (hysteresis — it won't flap).
 
-CPU type detection reads `/proc/cpuinfo` and works across architectures:
+A governor is applied per cluster (or the whole CPU, if there's only one), not per
+individual core — there's no need to micromanage 8-12 cores one at a time, and no need
+to know exactly which logical core id belongs to which cluster. Only two things matter:
+how many distinct core models the board has, and how many cores of each — both come
+straight from `lscpu -J` (util-linux), which already ships (and maintains) its own
+vendor/model name tables for every architecture, so this plugin doesn't hand-roll one.
+`lscpu -J` reports each distinct CPU model on the board together with its
+`Core(s) per socket:` / `Socket(s):` / `Thread(s) per core:`, which multiply out to how
+many cores that model has (confirmed against a real 4x Cortex-A53 + 4x Cortex-A72
+board). The specific core ids for each model aren't in that output, but don't need to
+be looked up separately either: the kernel always enumerates a cluster's cores
+contiguously in discovery order, so the Nth model block simply claims the next N ids.
 
-- **ARM**: groups by `CPU implementer` / `CPU part`, mapped to friendly names
-  (Cortex-A53, Cortex-A72, etc.) via a lookup table; unrecognized parts show as
-  `part 0x...`.
-- **RISC-V**: groups by `mvendorid`/`marchid` where the kernel exposes them, falling
-  back to the `isa` string (e.g. `RISC-V (rv64imafdc)`) on kernels that don't. The
-  vendor/arch-id → friendly-name table is currently just a seed (a wrong guess there
-  would silently mislabel a board) — cores still group and work correctly either way,
-  just displayed with the raw hex until a name is added. **Contributions welcome**:
-  send a PR with `cat /proc/cpuinfo` from your board to add an entry.
-- **x86_64 and everything else**: groups by `model name`. On Intel hybrid designs
-  (P-core/E-core), where every core reports the same `model name`, the split is
-  refined using the kernel's `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`
-  cpumasks.
+**Requires `lscpu` (part of `util-linux`).** It's present on essentially every
+Debian-based SBC image (Raspberry Pi OS, Armbian, DietPi), but not on minimal
+containers such as `node:alpine` — install it there with `apk add util-linux`. If
+`lscpu` is missing, or its counts don't add up to the board's total CPU count (parse
+gone wrong, unexpected format), the plugin logs an error and disables itself rather
+than guess at CPU topology.
 
 Check available governors on your board first:
 
