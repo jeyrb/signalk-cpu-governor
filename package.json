@@ -1,0 +1,18 @@
+{
+  "name": "signalk-cpu-governor",
+  "version": "0.2.0",
+  "description": "Switches per-cluster SBC CPU frequency governors based on rules matched against SignalK data paths, with per-CPU-type (e.g. big.LITTLE) rule sets.",
+  "main": "index.js",
+  "files": [
+    "index.js"
+  ],
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-utility"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  }
+}
